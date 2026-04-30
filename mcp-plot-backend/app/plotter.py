@@ -39,7 +39,25 @@ class PlotConfig:
     raw_center: float = 63.5
 
 
-def _parse_filename_metadata(filename: str) -> dict:
+@dataclass(frozen=True)
+class FilenameMetadata:
+    description: str
+    energy_keV: str
+    species_raw: str
+    species_label: str
+    amps: str
+
+
+@dataclass(frozen=True)
+class PlotTitleInfo:
+    plot_title: str
+    title_line: str
+    matched_convention: bool
+    used_fallback_title: bool
+    warning: str | None
+
+
+def parse_filename_metadata(filename: str) -> FilenameMetadata | None:
     """
     Parse filenames of the form:
         description_number_species_amps.csv
@@ -55,10 +73,7 @@ def _parse_filename_metadata(filename: str) -> dict:
     parts = stem.rsplit("_", 3)
 
     if len(parts) != 4:
-        raise ValueError(
-            f"Filename '{filename}' does not match expected pattern "
-            f"'description_number_species_amps.csv'"
-        )
+        return None
 
     description, energy_keV, species_raw, amps = parts
 
@@ -72,28 +87,75 @@ def _parse_filename_metadata(filename: str) -> dict:
     }
     species_label = species_map.get(species_raw, f"{species_raw}+")
 
-    return {
-        "description": description.strip(),
-        "energy_keV": energy_keV.strip(),
-        "species_raw": species_raw,
-        "species_label": species_label,
-        "amps": amps,
-    }
+    return FilenameMetadata(
+        description=description.strip(),
+        energy_keV=energy_keV.strip(),
+        species_raw=species_raw,
+        species_label=species_label,
+        amps=amps,
+    )
 
 
-def build_title_from_filename(filename: str, date_str: str | None = None) -> str:
+def is_specific_filename(filename: str) -> bool:
+    return parse_filename_metadata(filename) is not None
+
+
+def _fallback_title_from_filename(filename: str) -> str:
+    return Path(filename).stem
+
+
+def _warning_for_filename(filename: str, used_fallback_title: bool, has_title_override: bool) -> str | None:
+    if is_specific_filename(filename):
+        return None
+
+    if has_title_override:
+        return "Filename did not match metadata convention; using the custom title override."
+
+    if used_fallback_title:
+        return "Filename did not match metadata convention; using filename as plot title."
+
+    return "Filename did not match metadata convention."
+
+
+def build_plot_title(
+    filename: str,
+    date_str: str | None = None,
+    title_override: str | None = None,
+) -> PlotTitleInfo:
     """
     Builds the required title format:
 
         MM/DD/YYYY
         1keV H+ - HC: 2.0A
     """
-    meta = _parse_filename_metadata(filename)
-
     if date_str is None:
         date_str = datetime.now().strftime("%m/%d/%Y")
 
-    return f"{date_str}\n{meta['energy_keV']}keV {meta['species_label']} - HC: {meta['amps']}A"
+    normalized_override = title_override.strip() if title_override and title_override.strip() else None
+    meta = parse_filename_metadata(filename)
+    matched_convention = meta is not None
+
+    if normalized_override is not None:
+        title_line = normalized_override
+        used_fallback_title = False
+    elif meta is not None:
+        title_line = f"{meta.energy_keV}keV {meta.species_label} - HC: {meta.amps}A"
+        used_fallback_title = False
+    else:
+        title_line = _fallback_title_from_filename(filename)
+        used_fallback_title = True
+
+    return PlotTitleInfo(
+        plot_title=f"{date_str}\n{title_line}",
+        title_line=title_line,
+        matched_convention=matched_convention,
+        used_fallback_title=used_fallback_title,
+        warning=_warning_for_filename(
+            filename=filename,
+            used_fallback_title=used_fallback_title,
+            has_title_override=normalized_override is not None,
+        ),
+    )
 
 
 def output_png_name(filename: str) -> str:
@@ -223,6 +285,7 @@ def render_plot_png(
     filename: str,
     cfg: PlotConfig = PlotConfig(),
     date_str: str | None = None,
+    title_override: str | None = None,
 ) -> bytes:
     """
     Render one MCP file to PNG bytes.
@@ -231,7 +294,7 @@ def render_plot_png(
     """
     df = _parse_uploaded_csv(file_bytes)
     grid = _build_grid(df, cfg)
-    title = build_title_from_filename(filename, date_str=date_str)
+    title_info = build_plot_title(filename, date_str=date_str, title_override=title_override)
 
     fig, ax = plt.subplots(figsize=cfg.figsize, dpi=cfg.dpi)
 
@@ -264,7 +327,7 @@ def render_plot_png(
     ax.set_ylabel("y")
     ax.set_xlim(cfg.axis_min, cfg.axis_max)
     ax.set_ylim(cfg.axis_min, cfg.axis_max)
-    ax.set_title(title.strip(), fontweight="bold")
+    ax.set_title(title_info.plot_title.strip(), fontweight="bold")
 
     fig.tight_layout()
 

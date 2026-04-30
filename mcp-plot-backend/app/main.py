@@ -1,13 +1,14 @@
 import asyncio
 import io
+import json
 import os
 import zipfile
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
-from .plotter import PlotConfig, render_plot_png
+from .plotter import PlotConfig, build_plot_title, render_plot_png
 
 app = FastAPI(title="MCP Plot Renderer", version="1.0")
 
@@ -56,6 +57,51 @@ def health():
 
 def _png_output_name(filename: str) -> str:
     return f"{os.path.splitext(filename)[0]}.png"
+
+
+def _parse_batch_metadata(metadata_raw: str | None) -> list[dict[str, str | None]]:
+    if metadata_raw is None or not metadata_raw.strip():
+        return []
+
+    try:
+        parsed = json.loads(metadata_raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid metadata payload: {exc.msg}")
+
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=400, detail="Invalid metadata payload: expected a JSON array.")
+
+    normalized: list[dict[str, str | None]] = []
+    for idx, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid metadata payload at index {idx}: expected an object.",
+            )
+
+        original_filename = item.get("originalFilename")
+        title_override = item.get("titleOverride")
+
+        if not isinstance(original_filename, str) or not original_filename.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid metadata payload at index {idx}: missing originalFilename.",
+            )
+
+        if title_override is not None and not isinstance(title_override, str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid metadata payload at index {idx}: titleOverride must be a string.",
+            )
+
+        normalized.append(
+            {
+                "originalFilename": original_filename,
+                "titleOverride": title_override,
+            }
+        )
+
+    return normalized
 
 
 async def _read_and_validate_file(file: UploadFile) -> tuple[str, bytes]:
@@ -112,7 +158,10 @@ async def render(file: UploadFile = File(...)):
 # Batch render endpoint
 # -----------------------------------
 @app.post("/render-batch")
-async def render_batch(files: list[UploadFile] = File(...)):
+async def render_batch(
+    files: list[UploadFile] = File(...),
+    metadata: str | None = Form(None),
+):
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
 
@@ -122,35 +171,80 @@ async def render_batch(files: list[UploadFile] = File(...)):
             detail=f"Too many files. Max {MAX_BATCH_FILES} files per batch.",
         )
 
+    metadata_entries = _parse_batch_metadata(metadata)
+    if metadata_entries and len(metadata_entries) != len(files):
+        raise HTTPException(
+            status_code=400,
+            detail="Metadata payload length must match the number of uploaded files.",
+        )
+
+    metadata_by_index = {
+        idx: item for idx, item in enumerate(metadata_entries)
+    }
+
     validated_files = []
-    for file in files:
+    for idx, file in enumerate(files):
         filename, data = await _read_and_validate_file(file)
         if not filename.lower().endswith(".csv"):
             raise HTTPException(status_code=400, detail=f"Only CSV files are supported: {filename}")
-        validated_files.append((filename, data))
+        title_override = None
+        metadata_item = metadata_by_index.get(idx)
+        if metadata_item is not None:
+            metadata_filename = metadata_item["originalFilename"]
+            if metadata_filename != filename:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Metadata filename mismatch at index {idx}: "
+                        f"expected '{filename}', got '{metadata_filename}'."
+                    ),
+                )
+            title_override = metadata_item["titleOverride"]
 
-    async def render_one(filename: str, data: bytes) -> tuple[str, bytes]:
+        validated_files.append((filename, data, title_override))
+
+    async def render_one(
+        filename: str,
+        data: bytes,
+        title_override: str | None,
+    ) -> tuple[str, bytes, dict[str, object | None]]:
         try:
+            title_info = build_plot_title(filename, title_override=title_override)
             png_bytes = await asyncio.to_thread(
                 render_plot_png,
                 data,
                 filename,
                 CFG,
+                None,
+                title_override,
             )
-            return _png_output_name(filename), png_bytes
+            output_name = _png_output_name(filename)
+            manifest_entry = {
+                "originalFilename": filename,
+                "pngFilename": output_name,
+                "matchedConvention": title_info.matched_convention,
+                "title": title_info.title_line,
+                "usedFallbackTitle": title_info.used_fallback_title,
+                "warning": title_info.warning,
+            }
+            return output_name, png_bytes, manifest_entry
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"{filename}: {str(e)}")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"{filename}: Failed to render plot: {str(e)}")
 
     rendered_results = await asyncio.gather(
-        *(render_one(filename, data) for filename, data in validated_files)
+        *(render_one(filename, data, title_override) for filename, data, title_override in validated_files)
     )
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for output_name, png_bytes in rendered_results:
+        manifest_entries = []
+        for output_name, png_bytes, manifest_entry in rendered_results:
             zf.writestr(output_name, png_bytes)
+            manifest_entries.append(manifest_entry)
+
+        zf.writestr("manifest.json", json.dumps(manifest_entries, indent=2))
 
     zip_buffer.seek(0)
 

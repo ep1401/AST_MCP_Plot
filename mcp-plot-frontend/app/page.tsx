@@ -1,8 +1,25 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+
+type SelectedFileItem = {
+  id: string;
+  file: File;
+  matchedConvention: boolean;
+  suggestedTitle: string;
+  titleInput: string;
+};
+
+type BatchManifestEntry = {
+  originalFilename: string;
+  pngFilename: string;
+  matchedConvention: boolean;
+  title: string;
+  usedFallbackTitle: boolean;
+  warning: string | null;
+};
 
 type GeneratedItem = {
   id: string;
@@ -11,6 +28,10 @@ type GeneratedItem = {
   pngUrl: string;
   downloadName: string;
   isPreviewOpen: boolean;
+  matchedConvention: boolean;
+  usedFallbackTitle: boolean;
+  title: string;
+  warning: string | null;
 };
 
 function formatBytes(bytes: number): string {
@@ -23,6 +44,33 @@ function formatBytes(bytes: number): string {
 
 function getFileId(file: File): string {
   return `${file.name}__${file.size}__${file.lastModified}`;
+}
+
+function buildSuggestedTitle(filename: string): { matchedConvention: boolean; title: string } {
+  const stem = filename.replace(/\.[^.]+$/, "");
+  const parts = stem.split("_");
+
+  if (parts.length < 4) {
+    return { matchedConvention: false, title: stem };
+  }
+
+  const ampsPart = parts[parts.length - 1].replace(/\s*\(\d+\)\s*$/, "").trim();
+  const speciesRaw = parts[parts.length - 2].trim();
+  const energy = parts[parts.length - 3].trim();
+
+  if (!energy || !speciesRaw || !ampsPart) {
+    return { matchedConvention: false, title: stem };
+  }
+
+  const speciesMap: Record<string, string> = {
+    H: "H+",
+    He: "He+",
+  };
+
+  return {
+    matchedConvention: true,
+    title: `${energy}keV ${speciesMap[speciesRaw] ?? `${speciesRaw}+`} - HC: ${ampsPart}A`,
+  };
 }
 
 function getFilenameFromContentDisposition(header: string | null): string | null {
@@ -64,6 +112,68 @@ function parseErrorMessage(text: string): string {
     // ignore
   }
   return text || "Something went wrong.";
+}
+
+async function extractBatchZip(
+  zipBlobInput: Blob
+): Promise<{ items: GeneratedItem[]; manifest: BatchManifestEntry[] }> {
+  const JSZipModule = await import("jszip");
+  const JSZip = JSZipModule.default;
+  const zip = await JSZip.loadAsync(zipBlobInput);
+  const items: GeneratedItem[] = [];
+  let manifest: BatchManifestEntry[] = [];
+
+  const manifestEntry = zip.files["manifest.json"];
+  if (manifestEntry && !manifestEntry.dir) {
+    try {
+      const manifestText = await manifestEntry.async("text");
+      const parsed = JSON.parse(manifestText);
+      if (Array.isArray(parsed)) {
+        manifest = parsed.filter(
+          (item): item is BatchManifestEntry =>
+            !!item &&
+            typeof item.originalFilename === "string" &&
+            typeof item.pngFilename === "string" &&
+            typeof item.matchedConvention === "boolean" &&
+            typeof item.title === "string" &&
+            typeof item.usedFallbackTitle === "boolean" &&
+            (typeof item.warning === "string" || item.warning === null)
+        );
+      }
+    } catch {
+      manifest = [];
+    }
+  }
+
+  const manifestByPng = new Map(manifest.map((entry) => [entry.pngFilename, entry]));
+  const fileNames = Object.keys(zip.files).filter(
+    (name) => !zip.files[name].dir && name.toLowerCase().endsWith(".png")
+  );
+
+  for (const entryName of fileNames) {
+    const entry = zip.files[entryName];
+    const rawBlob = await entry.async("blob");
+    const pngBlob = new Blob([rawBlob], { type: "image/png" });
+    const pngUrl = URL.createObjectURL(pngBlob);
+    const pngFilename = entryName.split("/").pop() || "plot.png";
+    const manifestItem = manifestByPng.get(pngFilename);
+
+    items.push({
+      id: entryName,
+      originalName: manifestItem?.originalFilename ?? entryName.replace(/\.png$/i, ".csv"),
+      pngBlob,
+      pngUrl,
+      downloadName: pngFilename,
+      isPreviewOpen: false,
+      matchedConvention: manifestItem?.matchedConvention ?? true,
+      usedFallbackTitle: manifestItem?.usedFallbackTitle ?? false,
+      title: manifestItem?.title ?? pngFilename.replace(/\.png$/i, ""),
+      warning: manifestItem?.warning ?? null,
+    });
+  }
+
+  items.sort((a, b) => a.downloadName.localeCompare(b.downloadName));
+  return { items, manifest };
 }
 
 const styles = {
@@ -224,6 +334,41 @@ const styles = {
     fontSize: 12,
     marginTop: 4,
   } as const,
+  statusBadge: {
+    padding: "6px 10px",
+    borderRadius: 999,
+    fontSize: 11,
+    fontWeight: 800,
+    whiteSpace: "nowrap",
+  } as const,
+  titleFieldWrap: {
+    display: "grid",
+    gap: 6,
+  } as const,
+  titleLabel: {
+    color: "rgba(255,255,255,0.72)",
+    fontSize: 12,
+    fontWeight: 700,
+  } as const,
+  titleInput: {
+    width: "100%",
+    borderRadius: 12,
+    border: "1px solid rgba(255,255,255,0.16)",
+    background: "rgba(0,0,0,0.18)",
+    color: "white",
+    padding: "11px 12px",
+    fontSize: 13,
+    outline: "none",
+  } as const,
+  warningBox: {
+    padding: 14,
+    borderRadius: 14,
+    background: "rgba(248,113,113,0.12)",
+    border: "1px solid rgba(248,113,113,0.28)",
+    color: "rgba(255,255,255,0.9)",
+    fontSize: 13,
+    lineHeight: 1.5,
+  } as const,
   smallButton: {
     padding: "8px 11px",
     borderRadius: 10,
@@ -289,7 +434,7 @@ const styles = {
 export default function HomePage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [selectedFiles, setSelectedFiles] = useState<SelectedFileItem[]>([]);
   const [generatedItems, setGeneratedItems] = useState<GeneratedItem[]>([]);
   const [zipBlob, setZipBlob] = useState<Blob | null>(null);
   const [zipUrl, setZipUrl] = useState<string | null>(null);
@@ -301,13 +446,13 @@ export default function HomePage() {
   const zipUrlRef = useRef<string | null>(null);
   const generatedUrlsRef = useRef<string[]>([]);
 
-  const totalSelectedBytes = useMemo(
-    () => selectedFiles.reduce((sum, file) => sum + file.size, 0),
-    [selectedFiles]
-  );
+  const totalSelectedBytes = selectedFiles.reduce((sum, item) => sum + item.file.size, 0);
 
   const hasSelectedFiles = selectedFiles.length > 0;
   const hasGeneratedItems = generatedItems.length > 0;
+  const generatedWarnings = generatedItems.filter(
+    (item) => item.usedFallbackTitle || !item.matchedConvention
+  );
 
   useEffect(() => {
     return () => {
@@ -349,8 +494,20 @@ export default function HomePage() {
     clearGeneratedState();
 
     setSelectedFiles((prev) => {
-      const map = new Map(prev.map((file) => [getFileId(file), file]));
-      incoming.forEach((file) => map.set(getFileId(file), file));
+      const map = new Map(prev.map((item) => [item.id, item]));
+      incoming.forEach((file) => {
+        const id = getFileId(file);
+        if (map.has(id)) return;
+
+        const suggestion = buildSuggestedTitle(file.name);
+        map.set(id, {
+          id,
+          file,
+          matchedConvention: suggestion.matchedConvention,
+          suggestedTitle: suggestion.title,
+          titleInput: suggestion.title,
+        });
+      });
       return Array.from(map.values());
     });
 
@@ -360,7 +517,7 @@ export default function HomePage() {
   }
 
   function removeSelectedFile(fileId: string) {
-    setSelectedFiles((prev) => prev.filter((file) => getFileId(file) !== fileId));
+    setSelectedFiles((prev) => prev.filter((item) => item.id !== fileId));
   }
 
   function clearAllSelectedFiles() {
@@ -372,32 +529,10 @@ export default function HomePage() {
     }
   }
 
-  async function extractZipEntries(zipBlobInput: Blob): Promise<GeneratedItem[]> {
-    const JSZipModule = await import("jszip");
-    const JSZip = JSZipModule.default;
-    const zip = await JSZip.loadAsync(zipBlobInput);
-    const entries: GeneratedItem[] = [];
-
-    const fileNames = Object.keys(zip.files).filter((name) => !zip.files[name].dir);
-
-    for (const entryName of fileNames) {
-      const entry = zip.files[entryName];
-      const rawBlob = await entry.async("blob");
-      const pngBlob = new Blob([rawBlob], { type: "image/png" });
-      const pngUrl = URL.createObjectURL(pngBlob);
-
-      entries.push({
-        id: entryName,
-        originalName: entryName.replace(/\.png$/i, ".csv"),
-        pngBlob,
-        pngUrl,
-        downloadName: entryName.split("/").pop() || "plot.png",
-        isPreviewOpen: false,
-      });
-    }
-
-    entries.sort((a, b) => a.downloadName.localeCompare(b.downloadName));
-    return entries;
+  function updateSelectedTitle(fileId: string, titleInput: string) {
+    setSelectedFiles((prev) =>
+      prev.map((item) => (item.id === fileId ? { ...item, titleInput } : item))
+    );
   }
 
   async function handleGenerateGraphs() {
@@ -420,9 +555,15 @@ export default function HomePage() {
 
     try {
       const form = new FormData();
-      selectedFiles.forEach((file) => {
-        form.append("files", file);
+      const metadata = selectedFiles.map((item) => ({
+        originalFilename: item.file.name,
+        titleOverride: item.titleInput.trim(),
+      }));
+
+      selectedFiles.forEach((item) => {
+        form.append("files", item.file);
       });
+      form.append("metadata", JSON.stringify(metadata));
 
       const response = await fetch(`${API_BASE}/render-batch`, {
         method: "POST",
@@ -442,7 +583,7 @@ export default function HomePage() {
         getFilenameFromContentDisposition(contentDisposition) || "mcp_plots.zip";
 
       const resolvedZipUrl = URL.createObjectURL(zipBlobTyped);
-      const extractedItems = await extractZipEntries(zipBlobTyped);
+      const { items: extractedItems } = await extractBatchZip(zipBlobTyped);
 
       zipUrlRef.current = resolvedZipUrl;
       registerGeneratedUrls(extractedItems);
@@ -453,8 +594,8 @@ export default function HomePage() {
 
       setSelectedFiles([]);
       setGeneratedItems(extractedItems);
-    } catch (e: any) {
-      setError(e?.message ?? "Failed to generate graphs.");
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Failed to generate graphs.");
     } finally {
       setIsGenerating(false);
     }
@@ -493,8 +634,8 @@ export default function HomePage() {
           <h1 style={styles.heroTitle}>MCP Plot Generator</h1>
           <p style={styles.heroText}>
             Upload one or more MCP CSV files, generate standardized graphs, and download them as a
-            complete zip or as individual PNG files. Graph titles and output filenames are derived
-            automatically from the uploaded filenames.
+            complete zip or as individual PNG files. Titles can be inferred from the filename
+            convention or edited before generation.
           </p>
         </div>
 
@@ -603,29 +744,78 @@ export default function HomePage() {
 
               <div style={styles.list}>
                 {hasSelectedFiles ? (
-                  selectedFiles.map((file) => {
-                    const fileId = getFileId(file);
+                  selectedFiles.map((item) => {
+                    const warningStyle = !item.matchedConvention;
 
                     return (
-                      <div key={fileId} style={styles.fileRow}>
+                      <div
+                        key={item.id}
+                        style={{
+                          ...styles.fileRow,
+                          border: warningStyle
+                            ? "1px solid rgba(248,113,113,0.34)"
+                            : styles.fileRow.border,
+                        }}
+                      >
                         <div style={styles.fileTopRow}>
                           <div style={{ minWidth: 0 }}>
-                            <div style={styles.fileName}>{file.name}</div>
-                            <div style={styles.fileMeta}>{formatBytes(file.size)} • CSV</div>
+                            <div style={styles.fileName}>{item.file.name}</div>
+                            <div style={styles.fileMeta}>{formatBytes(item.file.size)} • CSV</div>
                           </div>
 
-                          <button
-                            type="button"
-                            onClick={() => removeSelectedFile(fileId)}
-                            disabled={isGenerating}
-                            style={
-                              isGenerating
-                                ? { ...styles.smallButton, cursor: "not-allowed", opacity: 0.6 }
-                                : styles.smallButton
-                            }
-                          >
-                            Remove
-                          </button>
+                          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                            <span
+                              style={{
+                                ...styles.statusBadge,
+                                background: item.matchedConvention
+                                  ? "rgba(34,197,94,0.18)"
+                                  : "rgba(248,113,113,0.16)",
+                                color: item.matchedConvention
+                                  ? "rgba(134,239,172,0.98)"
+                                  : "rgba(254,202,202,0.98)",
+                              }}
+                            >
+                              {item.matchedConvention ? "Convention match" : "Fallback title"}
+                            </span>
+
+                            <button
+                              type="button"
+                              onClick={() => removeSelectedFile(item.id)}
+                              disabled={isGenerating}
+                              style={
+                                isGenerating
+                                  ? { ...styles.smallButton, cursor: "not-allowed", opacity: 0.6 }
+                                  : styles.smallButton
+                              }
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        </div>
+
+                        <div style={styles.titleFieldWrap}>
+                          <label htmlFor={`title-${item.id}`} style={styles.titleLabel}>
+                            Plot title
+                          </label>
+                          <input
+                            id={`title-${item.id}`}
+                            type="text"
+                            value={item.titleInput}
+                            onChange={(event) => updateSelectedTitle(item.id, event.target.value)}
+                            placeholder={item.suggestedTitle}
+                            style={{
+                              ...styles.titleInput,
+                              border: warningStyle
+                                ? "1px solid rgba(248,113,113,0.32)"
+                                : styles.titleInput.border,
+                            }}
+                          />
+                          {!item.matchedConvention ? (
+                            <div style={styles.footerNote}>
+                              This filename does not match the metadata convention, so the filename
+                              stem is being used as the default title unless you override it.
+                            </div>
+                          ) : null}
                         </div>
                       </div>
                     );
@@ -689,14 +879,35 @@ export default function HomePage() {
                 </button>
               </div>
 
+              {generatedWarnings.length > 0 ? (
+                <div style={styles.warningBox}>
+                  Some files did not match the metadata naming convention, so their plot titles were
+                  generated from the filename or a custom override. You can rename the title before
+                  generating, or keep the fallback title.
+                </div>
+              ) : null}
+
               <div style={styles.list}>
                 {generatedItems.map((item) => (
-                  <div key={item.id} style={styles.resultRow}>
+                  <div
+                    key={item.id}
+                    style={{
+                      ...styles.resultRow,
+                      border:
+                        item.usedFallbackTitle || !item.matchedConvention
+                          ? "1px solid rgba(248,113,113,0.34)"
+                          : styles.resultRow.border,
+                    }}
+                  >
                     <div style={styles.resultHeader}>
                       <div style={{ minWidth: 0 }}>
                         <div style={styles.fileName}>{item.downloadName}</div>
                         <div style={styles.fileMeta}>
                           Generated from {item.originalName}
+                        </div>
+                        <div style={{ ...styles.footerNote, marginTop: 6 }}>
+                          Title: {item.title}
+                          {item.warning ? ` • ${item.warning}` : ""}
                         </div>
                       </div>
 
